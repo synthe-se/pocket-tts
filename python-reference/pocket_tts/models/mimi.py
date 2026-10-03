@@ -1,13 +1,16 @@
 import logging
+from typing import NoReturn
 
 import torch
 from torch import nn
 
 from pocket_tts.modules.conv import pad_for_conv1d
 from pocket_tts.modules.dummy_quantizer import DummyQuantizer
-from pocket_tts.modules.mimi_transformer import ProjectedTransformer
 from pocket_tts.modules.resample import ConvDownsample1d, ConvTrUpsample1d
 from pocket_tts.modules.seanet import SEANetDecoder, SEANetEncoder
+from pocket_tts.modules.stateful_module import ModelState
+from pocket_tts.modules.transformer import ProjectedTransformer
+from pocket_tts.utils.config import MimiConfig
 
 logger = logging.getLogger()
 
@@ -65,7 +68,7 @@ class MimiModel(nn.Module):
     def frame_size(self) -> int:
         return int(self.sample_rate / self.frame_rate)
 
-    def _to_framerate(self, x: torch.Tensor):
+    def _to_framerate(self, x: torch.Tensor) -> torch.Tensor:
         # Convert from the encoder frame rate to the overall framerate.
         _, _, length = x.shape
         frame_rate = self.encoder_frame_rate
@@ -74,7 +77,7 @@ class MimiModel(nn.Module):
             return x
         return self.downsample(x, model_state=None)
 
-    def _to_encoder_framerate(self, x: torch.Tensor, mimi_state) -> torch.Tensor:
+    def _to_encoder_framerate(self, x: torch.Tensor, mimi_state: ModelState) -> torch.Tensor:
         # Convert from overall framerate to the encoder frame rate.
         _, _, length = x.shape
         frame_rate = self.encoder_frame_rate
@@ -83,10 +86,13 @@ class MimiModel(nn.Module):
             return x
         return self.upsample(x, mimi_state)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> NoReturn:
         raise NotImplementedError()
 
-    def decode_from_latent(self, latent: torch.Tensor, mimi_state) -> torch.Tensor:
+    def decode_from_latent(self, latent: torch.Tensor, mimi_state: ModelState) -> torch.Tensor:
+        """Decodes [B, T, C] quantizer-space latents (as produced by
+        encode_to_latent or the flow LM) back to audio."""
+        latent = self.quantizer(latent.transpose(-1, -2))
         emb = self._to_encoder_framerate(latent, mimi_state)
         (emb,) = self.decoder_transformer(emb, mimi_state)
         out = self.decoder(emb, mimi_state)
@@ -100,7 +106,7 @@ class MimiModel(nn.Module):
             x (torch.Tensor): Float tensor of shape [B, C, T].
 
         Returns:
-            Unquantized embeddings.
+            Unquantized embeddings of shape [B, T, C].
         """
         assert x.dim() == 3, (
             f"CompressionModel._encode_to_unquantized_latent expects audio of shape [B, C, T] but got {x.shape}"
@@ -116,4 +122,28 @@ class MimiModel(nn.Module):
 
         (emb,) = self.encoder_transformer(emb, model_state=None)
         emb = self._to_framerate(emb)
-        return emb
+        return emb.transpose(-1, -2)
+
+
+def build_mimi(config: MimiConfig) -> MimiModel:
+    """MimiModel from a pocket-tts config's `mimi` section."""
+    from pocket_tts.modules import transformer
+    from pocket_tts.modules.dummy_quantizer import DummyQuantizer
+    from pocket_tts.modules.seanet import SEANetDecoder, SEANetEncoder
+
+    mimi_config = config.model_dump()
+    encoder = SEANetEncoder(**mimi_config["seanet"])
+    decoder = SEANetDecoder(**mimi_config["seanet"])
+    return MimiModel(
+        encoder,
+        decoder,
+        DummyQuantizer(**mimi_config["quantizer"]),
+        channels=mimi_config["channels"],
+        sample_rate=mimi_config["sample_rate"],
+        frame_rate=mimi_config["frame_rate"],
+        encoder_frame_rate=mimi_config["sample_rate"] / encoder.hop_length,
+        inner_dim=mimi_config["inner_dim"],
+        outer_dim=mimi_config["outer_dim"],
+        encoder_transformer=transformer.ProjectedTransformer(**mimi_config["transformer"]),
+        decoder_transformer=transformer.ProjectedTransformer(**mimi_config["transformer"]),
+    )
