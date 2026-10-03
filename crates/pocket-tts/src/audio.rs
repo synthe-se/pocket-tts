@@ -46,12 +46,12 @@ pub fn read_audio<P: AsRef<Path>>(path: P) -> anyhow::Result<(Tensor, u32)> {
 /// Decode a non-WAV audio file with symphonia to mono f32.
 #[cfg(all(not(target_arch = "wasm32"), feature = "audio-formats"))]
 fn read_audio_symphonia(path: &Path) -> anyhow::Result<(Tensor, u32)> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     let file = std::fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -60,58 +60,54 @@ fn read_audio_symphonia(path: &Path) -> anyhow::Result<(Tensor, u32)> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe().format(
+    let mut format = symphonia::default::get_probe().probe(
         &hint,
         mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     )?;
-    let mut format = probed.format;
     let track = format
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| anyhow::anyhow!("no audio track in {path:?}"))?;
     let track_id = track.id;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())?;
-
-    let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
-    let mut channels = track
+    let params = track
         .codec_params
-        .channels
-        .map(|c| c.count())
-        .unwrap_or(1)
-        .max(1);
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or_else(|| anyhow::anyhow!("no audio codec parameters in {path:?}"))?
+        .clone();
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())?;
+
+    let mut sample_rate = params.sample_rate.unwrap_or(0);
     let mut mono: Vec<f32> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut interleaved: Vec<f32> = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(symphonia::core::errors::Error::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Ok(Some(p)) => p,
+            // End of stream.
+            Ok(None) => break,
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
-            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(SymphoniaError::ResetRequired) => break,
             Err(e) => return Err(e.into()),
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             // Recoverable per symphonia docs: skip the malformed packet.
-            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => return Err(e.into()),
         };
-        let spec = *decoded.spec();
-        sample_rate = spec.rate;
-        channels = spec.channels.count().max(1);
-        let buf = sample_buf.get_or_insert_with(|| {
-            SampleBuffer::<f32>::new(decoded.capacity() as u64, spec)
-        });
-        buf.copy_interleaved_ref(decoded);
-        for frame in buf.samples().chunks_exact(channels) {
+        let spec = decoded.spec();
+        sample_rate = spec.rate();
+        let channels = spec.channels().count().max(1);
+        decoded.copy_to_vec_interleaved(&mut interleaved);
+        for frame in interleaved.chunks_exact(channels) {
             mono.push(frame.iter().sum::<f32>() / channels as f32);
         }
     }
@@ -286,9 +282,8 @@ pub fn write_wav_to_writer<W: std::io::Write + std::io::Seek>(
 
     let mut wav_writer = WavWriter::new(writer, spec)?;
     let pcm_bytes = pcm_i16_le_bytes(audio)?;
-    for chunk in pcm_bytes.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-        wav_writer.write_sample(sample)?;
+    for chunk in pcm_bytes.as_chunks::<2>().0 {
+        wav_writer.write_sample(i16::from_le_bytes(*chunk))?;
     }
     wav_writer.finalize()?;
     Ok(())
@@ -317,49 +312,39 @@ pub fn resample(audio: &Tensor, from_rate: u32, to_rate: u32) -> anyhow::Result<
         return Ok(audio.clone());
     }
 
-    use rubato::{FastFixedIn, Resampler};
+    use rubato::audioadapter_buffers::direct::SequentialSlice;
+    use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
 
-    // Calculate output size
     let ratio = to_rate as f64 / from_rate as f64;
-    let _new_num_samples = (num_samples as f64 * ratio) as usize;
 
-    // Convert candle Tensor to Vec<Vec<f32>> for rubato
-    // Rubato expects [channel][sample]
-    let audio_vec = audio.to_vec2::<f32>()?;
+    // Candle holds the clip as [C][T] row-major, which is exactly rubato's
+    // "sequential" layout, so the flattened tensor is handed over as is.
+    let input = audio.flatten_all()?.to_vec1::<f32>()?;
+    let input = SequentialSlice::new(&input, channels, num_samples)?;
 
-    // Create resampler
-    // FastFixedIn is synchronous and suitable for full-file resampling
-    let mut resampler = FastFixedIn::<f32>::new(
+    // Fixed-ratio polynomial (septic) interpolation; `process_all` feeds the
+    // whole clip through in chunks and trims the resampler's startup delay.
+    let mut resampler = Async::<f32>::new_poly(
         ratio,
-        1.0,                              // max_resample_ratio_relative (1.0 for fixed)
-        rubato::PolynomialDegree::Septic, // High quality interpolation
-        num_samples,                      // block_size_in
+        1.0, // max_resample_ratio_relative (1.0: the ratio never changes)
+        PolynomialDegree::Septic,
+        1024, // chunk size (input frames per internal call)
         channels,
+        FixedAsync::Input,
     )?;
+    let output = resampler.process_all(&input, num_samples, None)?;
 
-    // Resample
-    let resampled_vec = resampler.process(&audio_vec, None)?;
-
-    // Truncate or pad to exact expected length if necessary (rubato might return slightly more/less due to block/filter delay)
-    // But FastFixedIn with fixed block size should be mainly correct.
-    // We'll trust rubato's output but sanity check dimensions in the Tensor creation would be good.
-    // Actually, rubato might return a slightly different number of samples than naive calculation.
-    // Let's use whatever rubato returned.
-
-    let out_channels = resampled_vec.len();
-    let out_samples = resampled_vec[0].len();
-
-    // Flatten back to column-major (or whatever candle expects for from_vec)
-    // Candle from_vec takes a flat vector and shape.
-    // If we have [C][T], we need to flatten to C*T.
-    let mut flat_data = Vec::with_capacity(out_channels * out_samples);
-    for channel in resampled_vec {
-        flat_data.extend(channel);
+    // rubato returns interleaved frames; regroup them per channel for candle.
+    let interleaved = output.take_data();
+    let out_samples = interleaved.len() / channels;
+    let mut flat_data: Vec<f32> = Vec::with_capacity(channels * out_samples);
+    for ch in 0..channels {
+        flat_data.extend(interleaved.iter().skip(ch).step_by(channels));
     }
 
     Ok(Tensor::from_vec(
         flat_data,
-        (out_channels, out_samples),
+        (channels, out_samples),
         audio.device(),
     )?)
 }
@@ -392,8 +377,10 @@ mod tests {
 
         let bytes = pcm_i16_le_bytes(&t)?;
         let samples: Vec<i16> = bytes
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| i16::from_le_bytes(*chunk))
             .collect();
 
         assert_eq!(samples, vec![-32767, 16383, 0, -16383, 32767, 32767]);

@@ -100,7 +100,7 @@ pub fn get_attention_cursor(state: &ModelState, module_name: &str) -> AttentionC
 /// This is used after processing tokens to update position information
 /// for streaming generation.
 pub fn increment_steps(state: &mut ModelState, key: &str, increment: usize) {
-    for (_module_name, module_state) in state.iter_mut() {
+    for module_state in state.values_mut() {
         if let Some(step_tensor) = module_state.get_mut(key)
             && let Ok(current) = step_tensor.to_scalar::<i64>()
             && let Ok(new_tensor) = Tensor::new(current + increment as i64, step_tensor.device())

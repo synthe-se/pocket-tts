@@ -5,9 +5,12 @@ use std::path::PathBuf;
 use candle_core::Device;
 
 #[cfg(not(target_arch = "wasm32"))]
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::{HFClientSync, HFError};
+
+/// How many 10 s cache-lock waits to sit through (about ten minutes) while
+/// another download of the same file finishes.
 #[cfg(not(target_arch = "wasm32"))]
-use hf_hub::{Repo, RepoType};
+const MAX_LOCK_WAITS: usize = 60;
 
 /// Download a file from HuggingFace Hub if necessary.
 ///
@@ -26,7 +29,6 @@ pub fn download_if_necessary(file_path: &str) -> Result<PathBuf> {
                 file_path
             );
         }
-        let repo_id = format!("{}/{}", parts[0], parts[1]);
         let filename_with_revision = parts[2..].join("/");
 
         // Parse optional revision from filename (e.g., "file.safetensors@abc123")
@@ -37,21 +39,28 @@ pub fn download_if_necessary(file_path: &str) -> Result<PathBuf> {
             (filename_with_revision, None)
         };
 
-        // Use ApiBuilder to support HF_TOKEN from environment
-        let token = std::env::var("HF_TOKEN").ok();
+        // The client resolves the token itself (HF_TOKEN, then HF_TOKEN_PATH,
+        // then $HF_HOME/token) and downloads into the standard HF cache.
+        let client = HFClientSync::new()?;
+        let repo = client.model(parts[0], parts[1]);
 
-        let api = ApiBuilder::new().with_token(token).build()?;
-
-        // Create repo with or without revision
-        let repo = if let Some(rev) = revision {
-            Repo::with_revision(repo_id, RepoType::Model, rev)
-        } else {
-            Repo::model(repo_id)
-        };
-
-        let api_repo = api.repo(repo);
-        let path = api_repo.get(&filename)?;
-        Ok(path)
+        // hf-hub gives up on a blob's cache lock after 10 s; when another
+        // thread or process is mid-way through the same first download
+        // (hundreds of MB), keep waiting for it instead of failing.
+        let mut attempts = 0;
+        loop {
+            match repo
+                .download_file()
+                .filename(filename.clone())
+                .maybe_revision(revision.clone())
+                .send()
+            {
+                Err(HFError::CacheLockTimeout { .. }) if attempts < MAX_LOCK_WAITS => {
+                    attempts += 1;
+                }
+                result => return Ok(result?),
+            }
+        }
     } else {
         Ok(PathBuf::from(file_path))
     }

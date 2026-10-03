@@ -52,7 +52,7 @@ fn sample_noise(
             // Rejection sampling for truncated normal
             let count = shape.0 * shape.1;
             let mut data = Vec::with_capacity(count);
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let dist = rand_distr::Normal::new(0.0f32, std)
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
