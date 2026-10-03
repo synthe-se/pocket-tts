@@ -1,6 +1,8 @@
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
+use crate::config::FlowType;
+
 pub type StepFn = Box<dyn Fn(&Tensor) -> Result<Tensor> + Send + Sync>;
 
 #[derive(Clone)]
@@ -220,6 +222,8 @@ pub struct SimpleMLPAdaLN {
     res_blocks: Vec<ResBlock>,
     final_layer: FinalLayer,
     num_time_conds: usize,
+    model_channels: usize,
+    flow_type: FlowType,
 }
 
 impl SimpleMLPAdaLN {
@@ -230,10 +234,11 @@ impl SimpleMLPAdaLN {
         out_channels: usize,
         cond_channels: usize,
         num_res_blocks: usize,
-        num_time_conds: usize,
+        flow_type: FlowType,
         max_period: f32,
         vb: VarBuilder,
     ) -> Result<Self> {
+        let num_time_conds = flow_type.num_time_conds();
         let mut time_embeds = Vec::new();
         for i in 0..num_time_conds {
             time_embeds.push(TimestepEmbedder::new(
@@ -264,7 +269,14 @@ impl SimpleMLPAdaLN {
             res_blocks,
             final_layer,
             num_time_conds,
+            model_channels,
+            flow_type,
         })
+    }
+
+    /// The sampling objective this head was trained for.
+    pub fn flow_type(&self) -> FlowType {
+        self.flow_type
     }
 
     pub fn forward(&self, c: &Tensor, s: &Tensor, t: &Tensor, x: &Tensor) -> Result<Tensor> {
@@ -276,6 +288,7 @@ impl SimpleMLPAdaLN {
         self.cond_embed.forward(c)
     }
 
+    /// One LSD step with explicit start/target times (two time conditions).
     pub fn forward_step(
         &self,
         x: &Tensor,
@@ -293,12 +306,21 @@ impl SimpleMLPAdaLN {
 }
 
 impl SimpleMLPAdaLN {
+    /// The combined time embedding of every decode step, `[steps, C]`.
+    ///
+    /// LSD conditions step `i` of `n` on (s, t) = (i/n, (i+1)/n), averaging
+    /// the two embeddings; flow matching on t = i/n alone (Euler
+    /// integration, upstream `ot_decode`); a drifting head has no time
+    /// condition and maps the noise in a single step, so it gets one zero row.
     pub fn compute_time_embeddings(
         &self,
         num_steps: usize,
         device: &candle_core::Device,
         dtype: DType,
     ) -> Result<Tensor> {
+        if self.flow_type == FlowType::Drifting {
+            return Tensor::zeros((1, self.model_channels), dtype, device);
+        }
         let mut embeddings = Vec::with_capacity(num_steps);
         for i in 0..num_steps {
             let s = i as f64 / num_steps as f64;
@@ -306,12 +328,18 @@ impl SimpleMLPAdaLN {
 
             // 1D Tensors [1]
             let s_tensor = Tensor::new(&[s as f32], device)?.to_dtype(dtype)?;
-            let t_tensor = Tensor::new(&[t as f32], device)?.to_dtype(dtype)?;
-
-            let t0 = self.time_embeds[0].forward(&s_tensor)?;
-            let t1 = self.time_embeds[1].forward(&t_tensor)?;
-            let t_combined = ((t0 + t1)? / self.num_time_conds as f64)?;
-            embeddings.push(t_combined);
+            let combined = match self.flow_type {
+                FlowType::Lsd => {
+                    let t_tensor = Tensor::new(&[t as f32], device)?.to_dtype(dtype)?;
+                    let t0 = self.time_embeds[0].forward(&s_tensor)?;
+                    let t1 = self.time_embeds[1].forward(&t_tensor)?;
+                    ((t0 + t1)? / self.num_time_conds as f64)?
+                }
+                // Flow matching's single time condition is the step start.
+                FlowType::FlowMatching => self.time_embeds[0].forward(&s_tensor)?,
+                FlowType::Drifting => unreachable!("handled above"),
+            };
+            embeddings.push(combined);
         }
         // stack of [1, 512] -> [num_steps, 1, 512]
         // squeeze(1) -> [num_steps, 512]

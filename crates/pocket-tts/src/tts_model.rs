@@ -11,6 +11,10 @@ use crate::models::mimi::MimiModel;
 use crate::models::seanet::{SEANetDecoder, SEANetEncoder};
 use crate::models::transformer::{ProjectedTransformer, StreamingTransformer};
 use crate::modules::mlp::SimpleMLPAdaLN;
+pub use crate::text_chunking::estimate_frames_after_eos;
+use crate::text_chunking::{
+    TextRules, find_boundary_indices, is_decimal_period_boundary, prepare_text_prompt,
+};
 use crate::voice_state::{
     ATTN_K_BUF_KEY, ATTN_LEN_KEY, ATTN_POS_KEY, ATTN_V_BUF_KEY, increment_steps, init_states,
 };
@@ -71,10 +75,9 @@ pub struct TTSModel {
     pub ldim: usize,
     /// Device
     pub device: Device,
-    /// Prepend 8 spaces to very short inputs (English checkpoints only).
-    pub pad_with_spaces_for_short_inputs: bool,
-    /// Replace `;` with `,` before tokenisation (multilingual checkpoints).
-    pub remove_semicolons: bool,
+    /// The config's text rules (padding, semicolons, terminal punctuation,
+    /// capitalization, character rewrites) applied to every prompt.
+    pub text_rules: TextRules,
     /// Model-recommended frames after EOS; overrides the heuristic when set.
     pub model_recommended_frames_after_eos: Option<usize>,
     /// Config stem the model was loaded from (e.g. "french_24l"), like
@@ -86,7 +89,22 @@ pub struct TTSModel {
     /// silently produce silence, so it is refused, like Python's
     /// `has_voice_cloning`.
     pub has_voice_cloning: bool,
+    /// True when the model comes from a config outside the shipped ones (a
+    /// local, `hf://` or `https://` YAML). The predefined voices are states
+    /// precomputed with the released weights of a language, so they are
+    /// refused for such a model (upstream `origin.is_relative_to(CONFIGS_DIR)`).
+    pub has_custom_config: bool,
 }
+
+/// EOS is ignored on the first frames: before speech starts the EOS logit of
+/// some voices can cross the threshold, and a short text then ends before
+/// the word is spoken (upstream `_MIN_FRAMES_BEFORE_EOS`, #319).
+const MIN_FRAMES_BEFORE_EOS: usize = 6;
+
+/// A fresh Mimi decoder state puts a small step (about -41 dBFS) in its
+/// first samples, heard as a click at the start of every chunk: the first
+/// 5 ms of each chunk are faded in (upstream #333/#335).
+const CHUNK_FADE_IN_SECONDS_INV: usize = 200;
 
 impl TTSModel {
     /// Load a pre-trained TTS model from HuggingFace
@@ -135,7 +153,7 @@ impl TTSModel {
         device: &Device,
     ) -> Result<Self> {
         // Find config file - look relative to the Rust crate, then fall back to Python location
-        let config_path = find_config_path(variant)?;
+        let (config_path, shipped) = find_config_path(variant)?;
         let config = load_config(&config_path)?;
 
         let mut model = Self::from_config(
@@ -152,6 +170,7 @@ impl TTSModel {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .or_else(|| Some(variant.to_string()));
+        model.has_custom_config = !shipped;
         Ok(model)
     }
 
@@ -368,18 +387,19 @@ impl TTSModel {
         let device = vb.device().clone();
 
         // Build FlowLM components
+        let text_rules = TextRules::from_config(&config)?;
         let dim = config.flow_lm.transformer.d_model;
         let ldim = config.mimi.quantizer.dimension;
         let hidden_dim = dim * config.flow_lm.transformer.hidden_scale;
 
-        // SimpleMLPAdaLN::new(in_channels, model_channels, out_channels, cond_channels, num_res_blocks, num_time_conds, max_period, vb)
+        // SimpleMLPAdaLN::new(in_channels, model_channels, out_channels, cond_channels, num_res_blocks, flow_type, max_period, vb)
         let flow_net = SimpleMLPAdaLN::new(
-            ldim,                      // in_channels (input is latent dim)
-            config.flow_lm.flow.dim,   // model_channels
-            ldim,                      // out_channels (output is also latent dim)
-            dim,                       // cond_channels (conditioning from transformer)
-            config.flow_lm.flow.depth, // num_res_blocks
-            2,                         // num_time_conds (s and t)
+            ldim,                          // in_channels (input is latent dim)
+            config.flow_lm.flow.dim,       // model_channels
+            ldim,                          // out_channels (output is also latent dim)
+            dim,                           // cond_channels (conditioning from transformer)
+            config.flow_lm.flow.depth,     // num_res_blocks
+            config.flow_lm.flow.flow_type, // lsd: s and t; flow_matching: t; drifting: none
             config.flow_lm.transformer.max_period as f32,
             vb.pp("flow_lm.flow_net"),
         )?;
@@ -527,11 +547,11 @@ impl TTSModel {
             dim,
             ldim,
             device,
-            pad_with_spaces_for_short_inputs: config.pad_with_spaces_for_short_inputs,
-            remove_semicolons: config.remove_semicolons,
+            text_rules,
             model_recommended_frames_after_eos: config.model_recommended_frames_after_eos,
             origin: None,
             has_voice_cloning: true,
+            has_custom_config: false,
         })
     }
 
@@ -756,8 +776,13 @@ impl TTSModel {
     }
 
     /// Create voice state from a reference-audio tensor (voice cloning).
+    ///
+    /// The prompt is first made to end on a short pause (upstream
+    /// `end_on_pause`, #334): a prompt stopping on speech makes the model
+    /// continue that utterance, one ending on a long silence delays the onset.
     pub fn get_voice_state_from_tensor(&self, audio: &Tensor) -> Result<ModelState> {
-        let conditioning = self.get_conditioning(audio)?;
+        let audio = crate::audio::end_on_pause(audio, self.sample_rate)?;
+        let conditioning = self.get_conditioning(&audio)?;
 
         // Run flow_lm with audio conditioning to update state
         let mut flow_state = init_states(1, 1000);
@@ -829,11 +854,7 @@ impl TTSModel {
     /// budget is word-batched instead of merely warned about, so a chunk
     /// can never overflow the token budget.
     pub fn split_into_best_sentences_with(&self, text: &str, max_tokens: usize) -> Vec<String> {
-        let prepared_text = prepare_text_prompt(
-            text,
-            self.pad_with_spaces_for_short_inputs,
-            self.remove_semicolons,
-        );
+        let prepared_text = prepare_text_prompt(text, &self.text_rules);
         let prepared_text = prepared_text.trim().to_string();
 
         let Ok(tokens) = self.conditioner.encode_ids(&prepared_text) else {
@@ -847,7 +868,17 @@ impl TTSModel {
             _ => return vec![prepared_text],
         };
 
-        let boundaries = find_boundary_indices(&tokens, &sentence_marks);
+        // A period between two digits ("98.6") is a decimal, not a sentence
+        // end (#217).
+        let boundaries = find_boundary_indices(&tokens, &sentence_marks, |idx| {
+            match (
+                self.conditioner.decode_ids(&tokens[..idx]),
+                self.conditioner.decode_ids(&tokens[idx..]),
+            ) {
+                (Ok(prefix), Ok(suffix)) => is_decimal_period_boundary(&prefix, &suffix),
+                _ => false,
+            }
+        });
         let mut segments = match self.segments_from_boundaries(&tokens, &boundaries) {
             Ok(s) => s,
             Err(_) => return vec![prepared_text],
@@ -874,7 +905,7 @@ impl TTSModel {
                     .ok()
                     .and_then(|sub_tokens| {
                         let sub_boundaries =
-                            find_boundary_indices(&sub_tokens, &fallback_marks);
+                            find_boundary_indices(&sub_tokens, &fallback_marks, |_| false);
                         self.segments_from_boundaries(&sub_tokens, &sub_boundaries)
                             .ok()
                     });
@@ -1247,11 +1278,7 @@ impl TTSModel {
         let mut mimi_state = init_states(1, 1000);
 
         // Prepare text
-        let prepared_text = prepare_text_prompt(
-            &text,
-            self.pad_with_spaces_for_short_inputs,
-            self.remove_semicolons,
-        );
+        let prepared_text = prepare_text_prompt(&text, &self.text_rules);
 
         // Error handling for preparation failures inside the iterator
         let tokens = match self.conditioner.prepare(&prepared_text, &self.device) {
@@ -1292,6 +1319,7 @@ impl TTSModel {
 
         let mut eos_step: Option<usize> = None;
         let mut finished = false;
+        let fade_in_len = self.sample_rate / CHUNK_FADE_IN_SECONDS_INV;
 
         // We need to move 'self' (reference) and owned data into the closure
         // But 'self' is in `generate_stream` lifetime?
@@ -1363,13 +1391,17 @@ impl TTSModel {
 
                 // Removed redundant increment_steps("offset") for mimi
 
-                Ok(audio)
+                if step == 0 {
+                    fade_in_chunk_start(&audio, fade_in_len)
+                } else {
+                    Ok(audio)
+                }
             })() {
                 Ok(frame) => frame,
                 Err(e) => return Some(Err(e)),
             };
 
-            if is_eos && eos_step.is_none() {
+            if is_eos && eos_step.is_none() && step >= MIN_FRAMES_BEFORE_EOS {
                 eos_step = Some(step);
             }
 
@@ -1454,11 +1486,7 @@ impl TTSModel {
         })
     }
     pub fn estimate_generation_steps(&self, text: &str) -> usize {
-        let prepared = prepare_text_prompt(
-            text,
-            self.pad_with_spaces_for_short_inputs,
-            self.remove_semicolons,
-        );
+        let prepared = prepare_text_prompt(text, &self.text_rules);
         let token_count = self
             .conditioner
             .count_tokens(&prepared)
@@ -1482,29 +1510,24 @@ enum Segment {
     Pause(u32),
 }
 
-/// Bridge an upstream packed KV cache `[2, B, T, H, D]` into this crate's
-/// per-layer buffers `(k_buf, v_buf)` of shape `[B, H, T, D]`.
-/// Find token indices where text should be split based on boundary tokens,
-/// mirroring upstream `_find_boundary_indices`: each consecutive pair of
-/// returned indices delimits one segment; the first element is always 0 and
-/// the last is always `tokens.len()`.
-fn find_boundary_indices(tokens: &[u32], boundary_tokens: &[u32]) -> Vec<usize> {
-    let mut indices = vec![0];
-    let mut previous_was_boundary = false;
-    for (idx, token) in tokens.iter().enumerate() {
-        if boundary_tokens.contains(token) {
-            previous_was_boundary = true;
-        } else {
-            if previous_was_boundary {
-                indices.push(idx);
-            }
-            previous_was_boundary = false;
-        }
+/// Multiply the start of a decoded chunk `[B, C, T]` by the first samples of
+/// a `ramp_len`-sample 0 -> 1 ramp (`torch.linspace(0, 1, ramp_len)`); a chunk
+/// shorter than the ramp only gets its beginning, like upstream.
+fn fade_in_chunk_start(audio: &Tensor, ramp_len: usize) -> Result<Tensor> {
+    let t = audio.dim(candle_core::D::Minus1)?;
+    let n = ramp_len.min(t);
+    if n == 0 {
+        return Ok(audio.clone());
     }
-    indices.push(tokens.len());
-    indices
+    let denom = ramp_len.saturating_sub(1).max(1) as f32;
+    let mut gain: Vec<f32> = (0..n).map(|i| i as f32 / denom).collect();
+    gain.resize(t, 1.0);
+    let gain = Tensor::from_vec(gain, t, audio.device())?.to_dtype(audio.dtype())?;
+    Ok(audio.broadcast_mul(&gain)?)
 }
 
+/// Bridge an upstream packed KV cache `[2, B, T, H, D]` into this crate's
+/// per-layer buffers `(k_buf, v_buf)` of shape `[B, H, T, D]`.
 fn unpack_kv_cache(packed: &Tensor) -> Result<(Tensor, Tensor)> {
     // [2, B, T, H, D] -> [2, B, H, T, D]
     let transposed = packed.transpose(2, 3)?;
@@ -1556,17 +1579,41 @@ pub fn export_model_state<P: AsRef<std::path::Path>>(state: &ModelState, dest: P
     Ok(())
 }
 
-/// Find the config file path for a variant
-fn find_config_path(variant: &str) -> Result<std::path::PathBuf> {
-    // A path to a YAML file is used directly (upstream's `config=` argument).
-    if variant.ends_with(".yaml") || variant.ends_with(".yml") {
+/// Find the config file for a variant, and whether it is one of the shipped
+/// language configs (`false` for a custom YAML: local, `hf://` or `https://`).
+fn find_config_path(variant: &str) -> Result<(std::path::PathBuf, bool)> {
+    // A YAML is used directly (upstream's `config=` argument): a local path,
+    // an `https://` URL or an `hf://` path, whose "@revision" suffix is not
+    // part of the extension.
+    let remote = variant.starts_with("hf://")
+        || variant.starts_with("http://")
+        || variant.starts_with("https://");
+    let suffix_source = if variant.starts_with("hf://") {
+        variant.rsplit_once('@').map_or(variant, |(path, _)| path)
+    } else if remote {
+        variant.split(['?', '#']).next().unwrap_or(variant)
+    } else {
+        variant
+    };
+    if suffix_source.ends_with(".yaml") || suffix_source.ends_with(".yml") {
+        if remote {
+            #[cfg(not(target_arch = "wasm32"))]
+            return Ok((crate::weights::download_if_necessary(variant)?, false));
+        }
         let path = std::path::PathBuf::from(variant);
         if path.exists() {
-            return Ok(path);
+            return Ok((path, false));
         }
         anyhow::bail!("Config file not found: {}. Did you make a typo?", variant);
     }
+    if remote {
+        anyhow::bail!("Config should be a path to a YAML file ending with .yaml");
+    }
+    find_shipped_config(variant).map(|path| (path, true))
+}
 
+/// Look a language name up among the shipped configs.
+fn find_shipped_config(variant: &str) -> Result<std::path::PathBuf> {
     let filename = format!("{}.yaml", variant);
 
     // 1. Try relative to Rust crate (crates/pocket-tts/config)
@@ -1620,8 +1667,12 @@ fn find_config_path(variant: &str) -> Result<std::path::PathBuf> {
                 .filter_map(|e| e.ok())
                 .filter_map(|e| {
                     let p = e.path();
-                    (p.extension().and_then(|x| x.to_str()) == Some("yaml"))
-                        .then(|| p.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+                    (p.extension().and_then(|x| x.to_str()) == Some("yaml")).then(|| {
+                        p.file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
                 })
                 .collect()
         })
@@ -1634,141 +1685,47 @@ fn find_config_path(variant: &str) -> Result<std::path::PathBuf> {
     )
 }
 
-/// Prepare text for generation, stripping pause markers for TTS processing
-fn prepare_text_prompt(
-    text: &str,
-    pad_with_spaces_for_short_inputs: bool,
-    remove_semicolons: bool,
-) -> String {
-    // First strip any explicit pause markers
-    let text = crate::pause::strip_pause_markers(text);
-
-    let mut text = text.trim().to_string();
-    if text.is_empty() {
-        return ".".to_string(); // Or handle error
-    }
-
-    text = text.replace(['\n', '\r'], " ").replace("  ", " ");
-
-    // #155: the multilingual checkpoints replace ';' with ',' before
-    // tokenisation (the French SentencePiece handles ',' pauses better).
-    if remove_semicolons {
-        text = text.replace(';', ",");
-    }
-
-    let word_count = text.split_whitespace().count();
-
-    // Ensure first character is uppercase
-    if let Some(first) = text.chars().next()
-        && !first.is_uppercase()
-    {
-        text = format!("{}{}", first.to_uppercase(), &text[first.len_utf8()..]);
-    }
-
-    // Ensure ends with punctuation
-    if let Some(last) = text.chars().last()
-        && last.is_alphanumeric()
-    {
-        text.push('.');
-    }
-
-    // Python logic: prepend spaces if too short. #155 gates this behind a
-    // per-checkpoint flag — the English models need it, the multilingual
-    // ones must not pad.
-    if pad_with_spaces_for_short_inputs && word_count < 5 {
-        text = format!("{}{}", " ".repeat(8), text);
-    }
-
-    text
-}
-
-/// Estimate frames after EOS based on text length
-pub fn estimate_frames_after_eos(text: &str) -> usize {
-    let word_count = text.split_whitespace().count();
-    if word_count <= 4 {
-        3 + 2 // prepare_text_prompt guess + 2
-    } else {
-        1 + 2 // prepare_text_prompt guess + 2
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_prepare_text_prompt() {
-        // Short texts (<5 words) get 8 spaces prepended (padding enabled)
-        assert_eq!(
-            prepare_text_prompt("hello world", true, false),
-            "        Hello world."
-        );
-        assert_eq!(
-            prepare_text_prompt("Hello world.", true, false),
-            "        Hello world."
-        );
-        assert_eq!(
-            prepare_text_prompt("  hello  ", true, false),
-            "        Hello."
-        );
-        // Long texts don't get spaces
-        assert_eq!(
-            prepare_text_prompt("one two three four five", true, false),
-            "One two three four five."
-        );
-        // Padding disabled: short text is not padded
-        assert_eq!(
-            prepare_text_prompt("hello world", false, false),
-            "Hello world."
-        );
-        // remove_semicolons: ';' becomes ','
-        assert_eq!(
-            prepare_text_prompt("one two; three four five", false, true),
-            "One two, three four five."
-        );
-    }
-
-    #[test]
     fn test_find_config_path() {
         // This MUST pass now that we've moved the config into the crate
-        let result = find_config_path("b6369a24");
-        assert!(result.is_ok(), "Config file should be found");
-        let path = result.unwrap();
+        let (path, shipped) = find_config_path("b6369a24").expect("Config file should be found");
         assert!(path.exists(), "Config file path should exist");
+        assert!(shipped);
     }
 
     #[test]
-    fn test_prepare_text_prompt_strips_pause_markers() {
-        // Pause markers should be stripped from text
-        let result = prepare_text_prompt("Hello [pause:500ms] world", true, false);
-        // The pause marker should be gone, replaced with space
-        assert!(!result.contains("[pause:"));
-        assert!(result.contains("Hello"));
-        assert!(result.contains("world"));
+    fn test_find_config_path_custom_yaml() {
+        let (_, shipped) = find_config_path("b6369a24").unwrap();
+        assert!(shipped);
+        let local = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join("english.yaml");
+        let (path, shipped) = find_config_path(local.to_str().unwrap()).unwrap();
+        assert_eq!(path, local);
+        assert!(
+            !shipped,
+            "a YAML path is a custom config, even a shipped file"
+        );
+        assert!(find_config_path("hf://kyutai/repo/model.safetensors@abc").is_err());
     }
 
     #[test]
-    fn test_prepare_text_prompt_handles_multiple_pauses() {
-        let result = prepare_text_prompt("One [pause:100ms] two [pause:1s] three", true, false);
-        assert!(!result.contains("[pause:"));
-        assert!(result.contains("One"));
-        assert!(result.contains("two"));
-        assert!(result.contains("three"));
-    }
-
-    #[test]
-    fn test_estimate_frames_after_eos() {
-        // Short text (<= 4 words)
-        assert_eq!(estimate_frames_after_eos("Hello world"), 5);
-        // Longer text (> 4 words)
-        assert_eq!(estimate_frames_after_eos("One two three four five"), 3);
-    }
-
-    #[test]
-    #[cfg(feature = "quantized")]
-    fn test_load_quantized_requires_feature() {
-        // This test only runs with --features quantized
-        // It verifies the load_quantized method exists and compiles
-        // Actual model loading requires HF_TOKEN
+    fn test_fade_in_chunk_start() -> Result<()> {
+        let audio = Tensor::ones((1, 1, 6), DType::F32, &Device::Cpu)?;
+        let faded = fade_in_chunk_start(&audio, 3)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(faded, vec![0.0, 0.5, 1.0, 1.0, 1.0, 1.0]);
+        // A chunk shorter than the ramp only gets the ramp's beginning.
+        let short = Tensor::ones((1, 1, 2), DType::F32, &Device::Cpu)?;
+        let faded = fade_in_chunk_start(&short, 5)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(faded, vec![0.0, 0.25]);
+        Ok(())
     }
 }

@@ -58,14 +58,14 @@ pub async fn start_server(args: ServeArgs) -> Result<()> {
         TTSModel::load_quantized_with_params(
             &model_spec,
             args.temperature,
-            args.lsd_decode_steps,
+            args.sampler_decode_steps,
             args.eos_threshold,
         )?
     } else {
         TTSModel::load_with_params(
             &model_spec,
             args.temperature,
-            args.lsd_decode_steps,
+            args.sampler_decode_steps,
             args.eos_threshold,
         )?
     };

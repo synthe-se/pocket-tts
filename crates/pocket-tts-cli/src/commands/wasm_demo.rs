@@ -39,8 +39,9 @@ pub async fn run(args: WasmDemoArgs) -> Result<()> {
         language: None,
         config: None,
         variant: Some("b6369a24".to_string()),
-        temperature: Some(0.7),
-        lsd_decode_steps: 1,
+        // The config's default_temperature (0.3 for every shipped model).
+        temperature: None,
+        sampler_decode_steps: pocket_tts::config::defaults::SAMPLER_DECODE_STEPS,
         eos_threshold: -4.0,
         quantize: false,
         voice_cache_capacity: 64,

@@ -36,10 +36,12 @@ pub struct ServeArgs {
     #[arg(short, long, default_value_t = 8000)]
     pub port: u16,
 
-    /// Default voice for API requests (can be overridden per-request);
-    /// defaults to the model's language voice (estelle for French, alba
-    /// for English, ...)
-    #[arg(long)]
+    /// Voice used by requests that don't ask for one (upstream
+    /// --default-voice, also accepted): a built-in voice name, a local audio
+    /// or .safetensors path, an https:// URL or an hf:// path. Defaults to
+    /// the model's language voice (estelle for French, alba for English,
+    /// ...), or alba's audio file with --config. Resolved at startup.
+    #[arg(long, alias = "default-voice")]
     pub voice: Option<String>,
 
     /// Language for the TTS model (english, french_24l, ...); incompatible
@@ -47,10 +49,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub language: Option<String>,
 
-    /// Path to a locally-saved model config .yaml file; incompatible with
-    /// --language
+    /// Model config .yaml file: a local path, an https:// URL or an hf://
+    /// path; incompatible with --language
     #[arg(long)]
-    pub config: Option<std::path::PathBuf>,
+    pub config: Option<String>,
 
     /// Back-compat alias of --language
     #[arg(long, hide = true)]
@@ -61,9 +63,9 @@ pub struct ServeArgs {
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// LSD decode steps
-    #[arg(long, default_value = "1")]
-    pub lsd_decode_steps: usize,
+    /// Sampler decode steps; the old --lsd-decode-steps name still works
+    #[arg(long, alias = "lsd-decode-steps", default_value_t = pocket_tts::config::defaults::SAMPLER_DECODE_STEPS)]
+    pub sampler_decode_steps: usize,
 
     /// EOS threshold
     #[arg(long, default_value = "-4.0")]

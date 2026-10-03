@@ -8,6 +8,33 @@ use std::path::Path;
 pub struct FlowConfig {
     pub dim: usize,
     pub depth: usize,
+    /// Sampler head: "lsd" (two time conditions, 1-step decode; every
+    /// released model), "flow_matching" (one time condition, Euler
+    /// integration, wants >= 16 decode steps) or "drifting" (no time
+    /// condition, the head maps noise to a sample in one step).
+    #[serde(default, rename = "type")]
+    pub flow_type: FlowType,
+}
+
+/// The flow head's sampling objective (upstream `FlowConfig.type`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowType {
+    #[default]
+    Lsd,
+    FlowMatching,
+    Drifting,
+}
+
+impl FlowType {
+    /// Number of time conditions the head is trained with.
+    pub fn num_time_conds(self) -> usize {
+        match self {
+            FlowType::Lsd => 2,
+            FlowType::FlowMatching => 1,
+            FlowType::Drifting => 0,
+        }
+    }
 }
 
 /// Transformer configuration for FlowLM
@@ -126,18 +153,35 @@ pub struct Config {
     /// Replace `;` with `,` before tokenisation (multilingual checkpoints).
     #[serde(default)]
     pub remove_semicolons: bool,
+    /// Make sure the prompt ends with sentence-final punctuation (#296).
+    #[serde(default = "default_true")]
+    pub append_terminal_punctuation: bool,
+    /// Upper-case the first letter of the prompt. Models whose text is
+    /// romanised phonemes switch it off: the capital is not in their
+    /// inventory (#c6f0aac).
+    #[serde(default = "default_true")]
+    pub capitalize_first_letter: bool,
+    /// Per-character rewrites applied before tokenization ("" deletes), for
+    /// characters the model's training text never contained (#497f399).
+    #[serde(default)]
+    pub replace_characters: std::collections::HashMap<String, String>,
     /// Model-recommended number of frames to keep generating after EOS.
     /// Overrides the heuristic when set.
     #[serde(default)]
     pub model_recommended_frames_after_eos: Option<usize>,
     /// Model-recommended sampling temperature, used when the caller does not
-    /// pass one (e.g. the English checkpoints prefer 0.3 per human evals).
+    /// pass one. 0.3 beats 0.7 on WER and UTMOS for every shipped model
+    /// (#223, #324); a config sets its own value only if tuned elsewhere.
     #[serde(default = "default_temperature")]
     pub default_temperature: f32,
 }
 
 fn default_temperature() -> f32 {
     defaults::TEMPERATURE
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Load configuration from a YAML file
@@ -149,8 +193,11 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Config> {
 
 /// Default generation parameters (matching Python's default_parameters.py)
 pub mod defaults {
-    pub const TEMPERATURE: f32 = 0.7;
-    pub const LSD_DECODE_STEPS: usize = 1;
+    pub const TEMPERATURE: f32 = 0.3;
+    /// Upstream DEFAULT_SAMPLER_DECODE_STEPS (was DEFAULT_LSD_DECODE_STEPS).
+    pub const SAMPLER_DECODE_STEPS: usize = 1;
+    /// Former name of [`SAMPLER_DECODE_STEPS`], kept for callers.
+    pub const LSD_DECODE_STEPS: usize = SAMPLER_DECODE_STEPS;
     pub const NOISE_CLAMP: Option<f32> = None;
     pub const EOS_THRESHOLD: f32 = -4.0;
     /// Upstream DEFAULT_LANGUAGE. The pre-language checkpoint "b6369a24"
@@ -174,6 +221,46 @@ mod tests {
             .join("pocket_tts")
             .join("config")
             .join("b6369a24.yaml")
+    }
+
+    fn shipped_configs() -> Vec<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn test_shipped_configs_sample_at_the_tuned_temperature() {
+        // Upstream #322/#324: every shipped model samples at 0.3.
+        let paths = shipped_configs();
+        assert!(paths.len() >= 20);
+        for path in paths {
+            let config = load_config(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            assert_eq!(config.default_temperature, 0.3, "{path:?}");
+            crate::text_chunking::TextRules::from_config(&config)
+                .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_flow_types() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config");
+        let drifting = load_config(dir.join("english_drifting_26-09.yaml")).unwrap();
+        assert_eq!(drifting.flow_lm.flow.flow_type, FlowType::Drifting);
+        assert_eq!(FlowType::Drifting.num_time_conds(), 0);
+        let lsd = load_config(dir.join("english.yaml")).unwrap();
+        assert_eq!(lsd.flow_lm.flow.flow_type, FlowType::Lsd);
+        let french = load_config(dir.join("french.yaml")).unwrap();
+        assert_eq!(
+            french.replace_characters.get("\u{ab}").map(String::as_str),
+            Some("")
+        );
+        assert!(french.capitalize_first_letter && french.append_terminal_punctuation);
     }
 
     #[test]

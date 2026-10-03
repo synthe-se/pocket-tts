@@ -48,6 +48,12 @@ const DEFAULT_TEXT_FOR_LANGUAGE: &[(&str, &str)] = &[
          Sou rápido o suficiente para rodar em CPUs pequenas. \
          Espero que você goste de mim.",
     ),
+    (
+        "dutch",
+        "Hallo wereld. Ik ben Pocket TTS van Kyutai. \
+         Ik ben snel genoeg om op kleine CPU's te draaien. \
+         Ik hoop dat je me leuk vindt.",
+    ),
 ];
 
 /// Pick the demo text for a variant when the user gives no --text.
@@ -64,7 +70,7 @@ fn default_text_for_variant(variant: &str) -> &'static str {
 /// back-compat alias of --language.
 pub fn resolve_model_spec(
     language: Option<&str>,
-    config: Option<&std::path::Path>,
+    config: Option<&str>,
     variant: Option<&str>,
 ) -> Result<String> {
     if config.is_some() && (language.is_some() || variant.is_some()) {
@@ -74,15 +80,13 @@ pub fn resolve_model_spec(
         anyhow::bail!("--variant is an alias of --language; pass only one of them.");
     }
     if let Some(path) = config {
-        return Ok(path.to_string_lossy().into_owned());
+        return Ok(path.to_string());
     }
-    let language = language.or(variant).unwrap_or(pocket_tts::config::defaults::DEFAULT_VARIANT);
-    if language == "french" {
-        anyhow::bail!(
-            "For technical reasons, only a larger 24-layer model is available for French. \
-             Please use the 'french_24l' language instead."
-        );
-    }
+    // Upstream used to refuse "french" (only french_24l existed); the
+    // 6-layer French model ships since 3.2.0.
+    let language = language
+        .or(variant)
+        .unwrap_or(pocket_tts::config::defaults::DEFAULT_VARIANT);
     Ok(language.to_string())
 }
 
@@ -113,10 +117,11 @@ pub struct GenerateArgs {
 
     /// Voice for synthesis. Can be:
     /// - Predefined name: alba, marius, ... (estelle, giovanni, lola, juergen,
-    ///   rafael for the language models); defaults to the model's language voice
+    ///   rafael, daan for the language models); defaults to the model's
+    ///   language voice, or to alba's audio file with --config
     /// - Path to .wav file for voice cloning
     /// - Path to .safetensors embeddings file
-    /// - HuggingFace URL: hf://owner/repo/file.wav
+    /// - HuggingFace URL: hf://owner/repo/file.wav, or an https:// URL
     #[arg(short, long)]
     pub voice: Option<String>,
 
@@ -125,16 +130,18 @@ pub struct GenerateArgs {
     pub output: PathBuf,
 
     /// Language for the TTS model: english, english_2026-01, english_2026-04,
-    /// french_24l, german(_24l), italian(_24l), portuguese(_24l), spanish(_24l).
-    /// The historical "b6369a24" name (= english_2026-01) still works.
-    /// Incompatible with --config. Default: english
+    /// english_2026-04_24l, english_2026-09, english_2026-09_24l,
+    /// english_drifting_26-09, french(_24l), german(_24l), italian(_24l),
+    /// portuguese(_24l), spanish(_24l), dutch(_24l). The historical
+    /// "b6369a24" name (= english_2026-01) still works. Incompatible with
+    /// --config. Default: english (the same model as english_2026-09)
     #[arg(long)]
     pub language: Option<String>,
 
-    /// Path to a locally-saved model config .yaml file; incompatible with
-    /// --language
+    /// Model config .yaml file: a local path, an https:// URL or an hf://
+    /// path; incompatible with --language
     #[arg(long)]
-    pub config: Option<PathBuf>,
+    pub config: Option<String>,
 
     /// Back-compat alias of --language
     #[arg(long, hide = true)]
@@ -149,9 +156,10 @@ pub struct GenerateArgs {
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// LSD decode steps (more steps = better quality, slower)
-    #[arg(long, default_value = "1")]
-    pub lsd_decode_steps: usize,
+    /// Sampler decode steps (more steps = better quality, slower); the old
+    /// --lsd-decode-steps name still works
+    #[arg(long, alias = "lsd-decode-steps", default_value_t = pocket_tts::config::defaults::SAMPLER_DECODE_STEPS)]
+    pub sampler_decode_steps: usize,
 
     /// EOS threshold (more negative = longer audio)
     #[arg(long, default_value = "-4.0")]
@@ -231,7 +239,7 @@ pub fn run(args: GenerateArgs) -> Result<()> {
         TTSModel::load_quantized_with_params_device(
             &model_spec,
             args.temperature,
-            args.lsd_decode_steps,
+            args.sampler_decode_steps,
             args.eos_threshold,
             args.noise_clamp,
             &device,
@@ -240,7 +248,7 @@ pub fn run(args: GenerateArgs) -> Result<()> {
         TTSModel::load_with_params_device(
             &model_spec,
             args.temperature,
-            args.lsd_decode_steps,
+            args.sampler_decode_steps,
             args.eos_threshold,
             args.noise_clamp,
             &device,

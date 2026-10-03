@@ -25,10 +25,10 @@ pub struct ExportVoiceArgs {
     #[arg(long)]
     pub language: Option<String>,
 
-    /// Path to a locally-saved model config .yaml file; incompatible with
-    /// --language
+    /// Model config .yaml file: a local path, an https:// URL or an hf://
+    /// path; incompatible with --language
     #[arg(long)]
-    pub config: Option<PathBuf>,
+    pub config: Option<String>,
 
     /// Back-compat alias of --language
     #[arg(long, hide = true)]
@@ -69,7 +69,7 @@ pub fn run(args: ExportVoiceArgs) -> Result<()> {
     let model = TTSModel::load_with_params_device(
         &model_spec,
         None,
-        pocket_tts::config::defaults::LSD_DECODE_STEPS,
+        pocket_tts::config::defaults::SAMPLER_DECODE_STEPS,
         pocket_tts::config::defaults::EOS_THRESHOLD,
         None,
         &device,

@@ -3,7 +3,7 @@
 //! This module provides unified voice resolution logic supporting:
 //! - Predefined voice names (alba, marius, etc.)
 //! - Local file paths
-//! - HuggingFace URLs (hf://...)
+//! - HuggingFace URLs (hf://...) and plain http(s) URLs
 //! - Base64-encoded audio data
 
 use anyhow::{Context, Result};
@@ -14,18 +14,18 @@ use std::path::PathBuf;
 
 /// Predefined stock voices from kyutai/pocket-tts-without-voice-cloning.
 /// The first eight are English; the language models bring their own
-/// (giovanni, lola, juergen, rafael, estelle), scoped under languages/.
+/// (giovanni, lola, juergen, rafael, estelle, daan), scoped under languages/.
 pub const PREDEFINED_VOICES: &[&str] = &[
     "alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma", "giovanni",
-    "lola", "juergen", "rafael", "estelle",
+    "lola", "juergen", "rafael", "estelle", "daan",
 ];
 
 /// HuggingFace repo for stock voice embeddings
 const STOCK_VOICE_REPO: &str = "kyutai/pocket-tts-without-voice-cloning";
 
 /// Pinned revision of the languages/ embeddings tree, matching Python's
-/// `get_predefined_voice`.
-const STOCK_VOICE_REVISION: &str = "e041936c75475d350b405bc870bcf7c22da4e9e6";
+/// `get_predefined_voice` (the states recomputed for the retrained models).
+const STOCK_VOICE_REVISION: &str = "1e08e6a23401048648a9fdcfde2f89348215c2a7";
 
 /// Default voice per language, matching Python's DEFAULT_VOICE_FOR_LANGUAGE
 /// (matched as a substring of the model origin, e.g. "french" in
@@ -36,13 +36,25 @@ const DEFAULT_VOICE_FOR_LANGUAGE: &[(&str, &str)] = &[
     ("german", "juergen"),
     ("portuguese", "rafael"),
     ("french", "estelle"),
+    ("dutch", "daan"),
 ];
 
 /// Fallback default voice (English stock).
 const DEFAULT_VOICE_FALLBACK: &str = "alba";
 
-/// Pick the default voice for a model from its origin (config stem).
+/// The audio behind the fallback voice (Python's
+/// `_ORIGINS_OF_PREDEFINED_VOICES["alba"]`). Predefined voices are states
+/// precomputed with the released weights of a language, so a model from a
+/// custom config cannot use them; it defaults to cloning this file instead
+/// (upstream `DEFAULT_VOICE_FOR_CUSTOM_MODEL`).
+pub const DEFAULT_VOICE_FOR_CUSTOM_MODEL: &str = "hf://kyutai/tts-voices/alba-mackenna/casual.wav";
+
+/// Pick the default voice for a model from its origin (config stem); a
+/// model from a custom config gets the fallback voice's audio file.
 pub fn default_voice_for(model: &TTSModel) -> &'static str {
+    if model.has_custom_config {
+        return DEFAULT_VOICE_FOR_CUSTOM_MODEL;
+    }
     let origin = model.origin.as_deref().unwrap_or("");
     DEFAULT_VOICE_FOR_LANGUAGE
         .iter()
@@ -80,10 +92,13 @@ fn is_bare_voice_name(spec: &str) -> bool {
 pub fn voice_cache_key(spec: &str) -> String {
     let spec = spec.trim();
 
-    // Mirror resolve_voice_spec's order: hf URL, then existing file, then
-    // bare predefined name, so the key never disagrees with resolution.
+    // Mirror resolve_voice_spec's order: hf/http URL, then existing file,
+    // then bare predefined name, so the key never disagrees with resolution.
     if spec.starts_with("hf://") {
         return format!("hf:{spec}");
+    }
+    if spec.starts_with("http://") || spec.starts_with("https://") {
+        return format!("url:{spec}");
     }
 
     let path = PathBuf::from(spec);
@@ -132,8 +147,9 @@ pub fn resolve_voice(model: &TTSModel, voice_spec: Option<&str>) -> Result<pocke
         Some(spec) => resolve_voice_spec(model, spec),
         None => {
             // Default voice depends on the model's language (Estelle for
-            // French, alba for English, ...).
-            resolve_predefined_voice(model, default_voice_for(model))
+            // French, alba for English, ...); a custom config clones alba's
+            // audio file instead.
+            resolve_voice_spec(model, default_voice_for(model))
         }
     }
 }
@@ -142,8 +158,8 @@ pub fn resolve_voice(model: &TTSModel, voice_spec: Option<&str>) -> Result<pocke
 fn resolve_voice_spec(model: &TTSModel, spec: &str) -> Result<pocket_tts::ModelState> {
     let spec = spec.trim();
 
-    // 1. Check if it's an hf:// URL
-    if spec.starts_with("hf://") {
+    // 1. Check if it's an hf:// or http(s):// URL
+    if spec.starts_with("hf://") || spec.starts_with("http://") || spec.starts_with("https://") {
         return resolve_hf_voice(model, spec);
     }
 
@@ -179,6 +195,14 @@ fn resolve_voice_spec(model: &TTSModel, spec: &str) -> Result<pocket_tts::ModelS
 
 /// Resolve a predefined voice name to embeddings via HF Hub
 fn resolve_predefined_voice(model: &TTSModel, name: &str) -> Result<pocket_tts::ModelState> {
+    if model.has_custom_config {
+        anyhow::bail!(
+            "Predefined voice {name:?} is a state precomputed with the released weights of a \
+             language; a model loaded from a custom config cannot use it (it leaves the model \
+             out of distribution and it typically never emits EOS). Pass the voice as an audio \
+             file instead, e.g. {DEFAULT_VOICE_FOR_CUSTOM_MODEL}"
+        );
+    }
     let hf_path = stock_voice_url(model, name);
 
     let local_path = download_if_necessary(&hf_path)
@@ -190,8 +214,17 @@ fn resolve_predefined_voice(model: &TTSModel, name: &str) -> Result<pocket_tts::
         .with_context(|| format!("Failed to load voice embeddings from {:?}", local_path))
 }
 
-/// Resolve an hf:// URL (audio or safetensors)
+/// Resolve an hf:// or http(s):// URL (audio or safetensors)
 fn resolve_hf_voice(model: &TTSModel, url: &str) -> Result<pocket_tts::ModelState> {
+    // Refuse cloning before downloading audio the model cannot use.
+    if !pocket_tts::weights::is_safetensors_source(url) && !model.has_voice_cloning {
+        anyhow::bail!(
+            "Voice cloning is unavailable: the without-voice-cloning checkpoint ships a zeroed \
+             Mimi encoder, so cloning '{url}' would produce silence. Use a predefined voice or a \
+             .safetensors embedding instead, or accept the terms at \
+             https://huggingface.co/kyutai/pocket-tts and authenticate (HF_TOKEN)."
+        );
+    }
     let local_path = download_if_necessary(url)
         .with_context(|| format!("Failed to download voice from '{}'", url))?;
 
@@ -304,6 +337,14 @@ mod tests {
         assert!(!is_base64_audio("alba"));
         assert!(!is_base64_audio("/path/to/file.wav"));
         assert!(!is_base64_audio("short"));
+    }
+
+    #[test]
+    fn test_voice_cache_key_url() {
+        assert_eq!(
+            voice_cache_key("https://example.com/v.wav"),
+            "url:https://example.com/v.wav"
+        );
     }
 
     #[test]

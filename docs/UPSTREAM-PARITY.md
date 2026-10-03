@@ -1,9 +1,14 @@
-# Upstream parity — kyutai-labs/pocket-tts @ main (d108410, 2026-07-16)
+# Upstream parity — kyutai-labs/pocket-tts @ main (41cbc84, 2026-10-01)
 
-The vendored python-reference was refreshed from v1.0.1 to upstream main.
-This file tracks every upstream behavior change since v1.0.1 and its status
-in the Rust port. Reference commit: d108410 ("Default the English model's
-temperature to 0.3 (#223)").
+The vendored python-reference tracks upstream main (training/ and .github/
+left out; the port's own extraction scripts kept). This file tracks every
+upstream behavior change and its status in the Rust port.
+
+- First sync: v1.0.1 -> d108410 ("Default the English model's temperature
+  to 0.3 (#223)", 2026-07-16), tables below.
+- Second sync: d108410 -> 41cbc84 ("Retrained French, Italian, Dutch,
+  German, Spanish and Portuguese models (#344)", 2026-10-01, 93 commits,
+  upstream 3.0.0 -> 3.3.0+), see "Sync 2" at the end.
 
 ## Status legend
 
@@ -115,3 +120,61 @@ temperature to 0.3 (#223)").
   encoder above, not candle. They now skip with an explicit message when
   has_voice_cloning is false.
 - q8_0 quantized generation verified working on Metal with candle 0.11.
+
+## Sync 2: d108410 -> 41cbc84 (upstream 3.0.0 to 3.3.0 and after)
+
+### Models and configs
+
+| Item | Upstream | Status |
+| --- | --- | --- |
+| New/updated configs: english (= english_2026-09 weights), english_2026-09(_24l), english_2026-04_24l, english_drifting_26-09, french (6L), french_24l, dutch(_24l), german/italian/portuguese/spanish(_24l) retrained (#245, #270, #321, #324, #336, #344) | 3.0-3.3 | DONE: configs copied verbatim into crates/pocket-tts/config (b6369a24.yaml kept as the legacy alias) |
+| Tokenizers as tokenizer.json (`tokenizer: tokenizers`), .model still supported (#317) | 3.2 | DONE: LUTConditioner already loaded .json through the tokenizers crate; verified vocab 4000 on every language loaded |
+| `default_temperature` 0.3 for every shipped model, config default 0.3 (#322, #324) | 3.2 | DONE: defaults::TEMPERATURE = 0.3; test_shipped_configs_sample_at_the_tuned_temperature mirrors upstream's |
+| "french" no longer refused (6-layer French model ships) | 3.2 | DONE: refusal removed from resolve_model_spec |
+| `flow.type`: lsd / flow_matching (Euler, `ot_decode`) / drifting (one-step head, no time condition) (#a11539e) | 3.3+ | DONE: FlowType in config.rs; SimpleMLPAdaLN builds 2/1/0 time embedders; drifting decodes as head(noise). english_drifting_26-09 verified intelligible (Whisper) |
+| `config=` accepts hf:// and https:// YAMLs (#c051c15 era) | 3.1 | DONE: find_config_path downloads them; such models count as custom (`has_custom_config`) |
+| `checkpoint=` training .pt loading (`load_training_checkpoint`, EMA overlay) | 3.0 | SKIPPED: torch pickle checkpoints; the port loads safetensors only. Export a checkpoint to safetensors first |
+| `has_custom_weights` refusal of predefined voices | 3.0 | DONE for custom configs (the only custom-weights path the port has): predefined names are refused with upstream's explanation |
+| `lsd_decode_steps` renamed `sampler_decode_steps`, old name deprecated | 3.0 | DONE: --sampler-decode-steps, --lsd-decode-steps kept as alias (clapier uses it); JSON accepts lsd_steps / sampler_decode_steps / lsd_decode_steps; library keeps its field name |
+| tanh GELU in the backbone FFN (#278) | 3.0 | HAD IT: candle's `gelu()` is the tanh approximation |
+
+### Text
+
+| Item | Upstream | Status |
+| --- | --- | --- |
+| `_ensure_terminal_punctuation`: closers, weak punctuation -> period (#296) | 3.1 | DONE (text_chunking.rs), upstream test cases ported |
+| `append_terminal_punctuation` / `capitalize_first_letter` config switches (#288, #c6f0aac) | 3.1 | DONE (TextRules) |
+| `replace_characters` per-config rewrites + stray-comma cleanup (#497f399) | 3.2 | DONE (TextRules), upstream test cases ported |
+| Decimal periods are not sentence boundaries (#217) | 3.0 | DONE: find_boundary_indices takes a veto; real-tokenizer check via `examples/split_debug.rs ... 12` |
+| Generation uses the prepared chunk text (#210) | 3.0 | HAD IT: generate_stream_segment always prepared the chunk |
+
+### Generation and audio
+
+| Item | Upstream | Status |
+| --- | --- | --- |
+| EOS ignored on the first 6 frames (#319) | 3.2 | DONE (MIN_FRAMES_BEFORE_EOS) |
+| 5 ms fade-in at each chunk start (fresh Mimi state click) (#333, #335) | 3.3 | DONE (fade_in_chunk_start on each segment's first frame) |
+| Voice prompts end on an 80 ms pause (`end_on_pause`) (#334) | 3.3 | DONE (audio::end_on_pause, applied in get_voice_state_from_tensor, i.e. every audio prompt; get_conditioning stays raw for the parity test) |
+| Predefined-voice revision e041936c -> 1e08e6a2, Dutch voice "daan" | 3.3 | DONE (voice.rs) |
+| Custom models default to alba's audio file (`DEFAULT_VOICE_FOR_CUSTOM_MODEL`) (#248) | 3.0 | DONE (default_voice_for) |
+| Dutch default text and voice | 3.3 | DONE |
+| http(s) download cache named sha256(url) + URL-path suffix, query strings ignored (#210) | 3.0 | DONE: weights::download_if_necessary gained the http(s) branch (~/.cache/pocket_tts), so http(s) voices and configs work |
+| `_is_safetensors_source` (hf revisions, URL queries) (#210) | 3.0 | DONE (weights::is_safetensors_source) |
+| Non-16-bit WAV prompts read correctly (#210) | 3.0 | HAD IT: hound reads 8/24/32-bit int and float WAVs |
+| Seekable WAV output gets a correct header (#210) | 3.0 | HAD IT: hound finalizes the header |
+| Generation errors reported before the decoder's "done" (#210) | 3.0 | N/A: the port's generation is a single iterator that yields the error itself |
+| Decoder thread decodes every queued latent per call (#90a4c5a) | 3.1 | N/A: the port decodes in the generation loop, one frame per step (no decoder thread; see the commented experiment in tts_model.rs) |
+| Stop generating when the client disconnects (#228) | 3.2 | HAD IT: /stream stops when the response channel closes; CLI streaming stops when stdout closes |
+| serve `--default-voice`, resolved at startup (#271) | 3.0 | DONE: --default-voice accepted as alias of --voice, which already resolved at startup |
+
+### Not ported (Python-only or training)
+
+- training/ (data prep, LSD/drifting training loops, dataloader, Muon,
+  SIGTERM checkpointing, manifests, tokenizer conversion): out of scope for
+  an inference port, and not vendored into python-reference.
+- Batched generation padding (`pad` in the KV-cache state, cached causal
+  masks for the stateless training path): training/batched-only.
+- Typing work (ty instead of beartype, ANN annotations), module renames
+  (mimi_transformer -> transformer -> attention), tts_model split into
+  text_chunking/model_state: no behavior change.
+- README community-model listings, deploy/swarm configs.

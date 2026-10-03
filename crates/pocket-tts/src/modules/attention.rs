@@ -1,10 +1,10 @@
 use crate::ModelState;
 use crate::modules::rope::RotaryEmbedding;
+use crate::quantize::MaybeQuantLinear;
 use crate::voice_state::{
     ATTN_K_BUF_KEY, ATTN_LEN_KEY, ATTN_POS_KEY, ATTN_V_BUF_KEY, AttentionCursor,
     read_attention_cursor, write_attention_cursor,
 };
-use crate::quantize::MaybeQuantLinear;
 use candle_core::{DType, Result, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;

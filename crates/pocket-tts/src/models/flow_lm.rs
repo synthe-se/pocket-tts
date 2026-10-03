@@ -1,9 +1,13 @@
 use crate::ModelState;
+use crate::config::FlowType;
 use crate::models::transformer::StreamingTransformer;
 use crate::modules::mlp::{LayerNorm, ModulationParams, SimpleMLPAdaLN};
 use candle_core::{Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
+/// Euler integration of the flow head from `x_0`: Lagrangian Self
+/// Distillation (https://arxiv.org/pdf/2505.18825) and, with one time
+/// condition, optimal-transport flow matching (upstream `ot_decode`).
 pub fn lsd_decode(
     flow_net: &SimpleMLPAdaLN,
     modulations: &[Vec<ModulationParams>],
@@ -168,7 +172,15 @@ impl FlowLMModel {
             .flow_net
             .precompute_modulations(&c_emb, time_embeddings)?;
 
-        let next_latent = lsd_decode(&self.flow_net, &modulations, &noise)?;
+        let next_latent = match self.flow_net.flow_type() {
+            // Both integrate the head's velocity from the noise; they differ
+            // only in the time conditions baked into the modulations.
+            FlowType::Lsd | FlowType::FlowMatching => {
+                lsd_decode(&self.flow_net, &modulations, &noise)?
+            }
+            // A drifting head's output for the noise is the sample itself.
+            FlowType::Drifting => self.flow_net.forward_step_cached(&noise, &modulations[0])?,
+        };
 
         Ok((next_latent, is_eos))
     }

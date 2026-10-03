@@ -147,9 +147,9 @@ for chunk in model.generate_stream("Long text here...", &voice_state) {
 
 ```rust
 let model = TTSModel::load_with_params(
-    "b6369a24",     // variant
-    0.7,            // temperature (higher = more variation)
-    1,              // lsd_decode_steps (more = better quality, slower)
+    "english",      // language (or a .yaml path / hf:// / https:// config)
+    Some(0.3),      // temperature; None = the config's default_temperature (0.3)
+    1,              // sampler decode steps (more = better quality, slower)
     -4.0,           // eos_threshold (more negative = longer audio)
 )?;
 ```
@@ -168,18 +168,26 @@ pocket-tts generate [OPTIONS]
 
 Options:
   -t, --text <TEXT>              Text to synthesize [default: greeting]
-  -v, --voice <VOICE>            Voice: predefined name, .wav file, or .safetensors
+  -v, --voice <VOICE>            Voice: predefined name, audio file, .safetensors,
+                                 hf:// or https:// URL [default: the language's voice]
   -o, --output <PATH>            Output file [default: output.wav]
-      --variant <VARIANT>        Model variant [default: b6369a24]
-      --temperature <FLOAT>      Sampling temperature [default: 0.7]
-      --lsd-decode-steps <INT>   LSD decode steps [default: 1]
+      --language <LANG>          english (= english_2026-09), english_2026-01/-04(_24l),
+                                 english_2026-09(_24l), english_drifting_26-09,
+                                 french(_24l), german(_24l), italian(_24l),
+                                 portuguese(_24l), spanish(_24l), dutch(_24l)
+                                 [default: english]
+      --config <YAML>            Custom config: local path, hf:// or https://
+      --temperature <FLOAT>      Sampling temperature [default: the config's, 0.3]
+      --sampler-decode-steps <INT>
+                                 Sampler decode steps [default: 1]
+                                 (--lsd-decode-steps still accepted)
       --eos-threshold <FLOAT>    EOS threshold [default: -4.0]
       --stream                   Stream raw PCM to stdout
   -q, --quiet                    Suppress output
       --use-metal                Use Metal acceleration (macOS)
 ```
 
-**Predefined voices:** `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`
+**Predefined voices:** `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`; the language models bring `estelle` (French), `giovanni` (Italian), `lola` (Spanish), `juergen` (German), `rafael` (Portuguese) and `daan` (Dutch).
 
 ### `serve` command
 
@@ -191,10 +199,13 @@ pocket-tts serve [OPTIONS]
 Options:
       --host <HOST>              Bind address [default: 127.0.0.1]
   -p, --port <PORT>              Port number [default: 8000]
-      --voice <VOICE>            Default voice [default: alba]
-      --variant <VARIANT>        Model variant [default: b6369a24]
-      --temperature <FLOAT>      Temperature [default: 0.7]
-      --lsd-decode-steps <INT>   LSD steps [default: 1]
+      --voice <VOICE>            Default voice, resolved at startup (alias
+                                 --default-voice) [default: the language's voice]
+      --language <LANG>          See generate [default: english]
+      --config <YAML>            Custom config: local path, hf:// or https://
+      --temperature <FLOAT>      Temperature [default: the config's, 0.3]
+      --sampler-decode-steps <INT>
+                                 Sampler decode steps [default: 1]
       --eos-threshold <FLOAT>    EOS threshold [default: -4.0]
       --ui <UI>                  Web UI mode: standard|wasm-experimental [default: standard]
 ```

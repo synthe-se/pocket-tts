@@ -20,7 +20,9 @@ const MAX_LOCK_WAITS: usize = 60;
 /// Note: Not available on wasm32 targets (use local file loading instead).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn download_if_necessary(file_path: &str) -> Result<PathBuf> {
-    if file_path.starts_with("hf://") {
+    if file_path.starts_with("http://") || file_path.starts_with("https://") {
+        download_url(file_path)
+    } else if file_path.starts_with("hf://") {
         let path = file_path.trim_start_matches("hf://");
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() < 3 {
@@ -66,10 +68,83 @@ pub fn download_if_necessary(file_path: &str) -> Result<PathBuf> {
     }
 }
 
+/// Upstream's plain-URL branch: the file lands in ~/.cache/pocket_tts as
+/// `sha256(url)` plus the extension of the URL path (query strings and
+/// fragments are not part of it), and is reused on later calls.
+#[cfg(not(target_arch = "wasm32"))]
+fn download_url(url: &str) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+
+    let cache_dir = std::env::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("no home directory for the download cache"))?
+        .join(".cache")
+        .join("pocket_tts");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let digest = Sha256::digest(url.as_bytes());
+    let mut name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    name.push_str(&url_path_suffix(url));
+    let cached = cache_dir.join(name);
+    if cached.exists() {
+        return Ok(cached);
+    }
+
+    // reqwest's blocking client refuses to run on a tokio worker (the server
+    // resolves its default voice from async code), so it gets its own thread.
+    let url_owned = url.to_string();
+    let bytes = std::thread::spawn(move || -> Result<Vec<u8>> {
+        let response = reqwest::blocking::get(&url_owned)?.error_for_status()?;
+        Ok(response.bytes()?.to_vec())
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("download thread panicked for {url}"))??;
+
+    // Write then rename, so an interrupted download never leaves a
+    // truncated file that later calls would trust.
+    let partial = cached.with_extension("partial");
+    std::fs::write(&partial, bytes)?;
+    std::fs::rename(&partial, &cached)?;
+    Ok(cached)
+}
+
+/// The extension (with its dot) of a URL's path, like Python's
+/// `Path(urlparse(url).path).suffix`; empty when there is none.
+#[cfg(not(target_arch = "wasm32"))]
+fn url_path_suffix(url: &str) -> String {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = after_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .split_once('/')
+        .map_or("", |(_, path)| path);
+    let last = path.rsplit('/').next().unwrap_or("");
+    match last.rfind('.') {
+        Some(dot) if dot > 0 => last[dot..].to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Whether a voice source names a `.safetensors` state rather than audio,
+/// looking past an `hf://` revision or a URL query string (upstream
+/// `_is_safetensors_source`).
+pub fn is_safetensors_source(source: &str) -> bool {
+    let path = if source.starts_with("http://") || source.starts_with("https://") {
+        source.split(['?', '#']).next().unwrap_or(source)
+    } else if source.starts_with("hf://") {
+        source.rsplit_once('@').map_or(source, |(path, _)| path)
+    } else {
+        source
+    };
+    path.ends_with(".safetensors")
+}
+
 /// WASM version: Only supports local file paths
 #[cfg(target_arch = "wasm32")]
 pub fn download_if_necessary(file_path: &str) -> Result<PathBuf> {
-    if file_path.starts_with("hf://") {
+    if file_path.starts_with("http://") || file_path.starts_with("https://") {
+        download_url(file_path)
+    } else if file_path.starts_with("hf://") {
         anyhow::bail!("HuggingFace Hub downloads not supported on WASM. Use local file paths.");
     }
     Ok(PathBuf::from(file_path))
@@ -94,6 +169,31 @@ mod tests {
         let path = "test.safetensors";
         let res = download_if_necessary(path).unwrap();
         assert_eq!(res, PathBuf::from(path));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_url_path_suffix() {
+        assert_eq!(url_path_suffix("https://x.org/a/b/voice.wav"), ".wav");
+        assert_eq!(url_path_suffix("https://x.org/voice.wav?token=1"), ".wav");
+        assert_eq!(url_path_suffix("https://x.org/v.tar.gz#frag"), ".gz");
+        assert_eq!(url_path_suffix("https://x.org/download"), "");
+        assert_eq!(url_path_suffix("https://x.org"), "");
+    }
+
+    #[test]
+    fn test_is_safetensors_source() {
+        assert!(is_safetensors_source("voice.safetensors"));
+        assert!(is_safetensors_source(
+            "hf://kyutai/repo/embeddings/alba.safetensors@abc123"
+        ));
+        assert!(is_safetensors_source(
+            "https://example.com/alba.safetensors?download=1"
+        ));
+        assert!(!is_safetensors_source("hf://kyutai/repo/alba.wav@abc123"));
+        assert!(!is_safetensors_source(
+            "https://example.com/a.wav?x=.safetensors"
+        ));
     }
 
     #[test]

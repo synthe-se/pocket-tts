@@ -153,6 +153,7 @@ pub struct GenerateRequest {
     text: String,
     voice: Option<String>,
     temperature: Option<f32>,
+    #[serde(alias = "sampler_decode_steps", alias = "lsd_decode_steps")]
     lsd_steps: Option<usize>,
     eos_threshold: Option<f32>,
     noise_clamp: Option<f32>,

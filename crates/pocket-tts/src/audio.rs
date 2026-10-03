@@ -298,6 +298,85 @@ pub fn normalize_peak(audio: &Tensor) -> anyhow::Result<Tensor> {
     }
 }
 
+/// End a voice prompt `[..., T]` on exactly 80 ms of silence (upstream
+/// `end_on_pause`, #334).
+///
+/// Training prompts end inside the pause between two words. A prompt that
+/// stops on speech makes the model continue that utterance (a burst at the
+/// start of every chunk, or a wrong first word), and one that ends on a long
+/// silence delays the onset. The trailing silence (20 ms frames more than
+/// 35 dB below the loudest one) is cut, the last 20 ms of what remains is
+/// faded out, and 80 ms of zeros is appended.
+pub fn end_on_pause(wav: &Tensor, sample_rate: usize) -> anyhow::Result<Tensor> {
+    const PAUSE_SEC: f64 = 0.08;
+    const FADE_SEC: f64 = 0.02;
+    const FLOOR_DB: f32 = 35.0;
+
+    let dims = wav.dims().to_vec();
+    let Some((&t, lead)) = dims.split_last() else {
+        return Ok(wav.clone());
+    };
+    let frame = ((0.02 * sample_rate as f64) as usize).max(1);
+    let n = t / frame;
+    if n == 0 {
+        return Ok(wav.clone());
+    }
+    let rows: usize = lead.iter().product();
+
+    let data = wav
+        .to_device(&candle_core::Device::Cpu)?
+        .to_dtype(candle_core::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    // RMS of each 20 ms frame over every row (batch and channels), in dB.
+    let mut db = Vec::with_capacity(n);
+    for f in 0..n {
+        let mut sum = 0.0f64;
+        for r in 0..rows {
+            let start = r * t + f * frame;
+            sum += data[start..start + frame]
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>();
+        }
+        let rms = (sum / (rows * frame) as f64).sqrt() as f32;
+        db.push(20.0 * (rms + 1e-12).log10());
+    }
+    let loudest = db.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let last_loud = db
+        .iter()
+        .rposition(|&d| d > loudest - FLOOR_DB)
+        .unwrap_or(n - 1);
+    let end = (last_loud + 1) * frame;
+
+    let fade = ((FADE_SEC * sample_rate as f64) as usize).min(end);
+    let pause = (PAUSE_SEC * sample_rate as f64) as usize;
+    let new_t = end + pause;
+    let mut out = Vec::with_capacity(rows * new_t);
+    for r in 0..rows {
+        let row = &data[r * t..r * t + end];
+        out.extend_from_slice(row);
+        // torch.linspace(1, 0, fade) over the last `fade` kept samples.
+        let base = out.len() - fade;
+        for i in 0..fade {
+            let gain = if fade == 1 {
+                1.0
+            } else {
+                1.0 - i as f32 / (fade - 1) as f32
+            };
+            out[base + i] *= gain;
+        }
+        out.resize(out.len() + pause, 0.0);
+    }
+
+    let mut new_dims = lead.to_vec();
+    new_dims.push(new_t);
+    Ok(Tensor::from_vec(out, new_dims, &candle_core::Device::Cpu)?
+        .to_dtype(wav.dtype())?
+        .to_device(wav.device())?)
+}
+
 // Matches Python's scipy.signal.resample_poly behavior
 pub fn resample(audio: &Tensor, from_rate: u32, to_rate: u32) -> anyhow::Result<Tensor> {
     if from_rate == to_rate {
@@ -357,7 +436,32 @@ pub fn resample_linear(audio: &Tensor, from_rate: u32, to_rate: u32) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Tensor};
+    use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn test_end_on_pause() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let sr = 1000; // 20-sample frames, 20-sample fade, 80-sample pause
+        // 100 samples of tone, then 100 of silence.
+        let mut data: Vec<f32> = (0..100).map(|i| ((i as f32) * 0.3).sin() * 0.5).collect();
+        data.extend(std::iter::repeat_n(0.0, 100));
+        let t = Tensor::from_vec(data.clone(), (1, 1, 200), &device)?;
+        let out = end_on_pause(&t, sr)?;
+        assert_eq!(out.dims(), &[1, 1, 180]); // 100 kept + 80 pause
+        let v = out.flatten_all()?.to_vec1::<f32>()?;
+        // Untouched before the fade, faded to zero at the cut, silent after.
+        assert_eq!(v[..80], data[..80]);
+        assert_eq!(v[99], 0.0);
+        assert!(v[100..].iter().all(|&x| x == 0.0));
+
+        // A prompt ending on speech keeps all of it and gains the pause.
+        let loud = Tensor::ones((1, 1, 100), DType::F32, &device)?;
+        assert_eq!(end_on_pause(&loud, sr)?.dims(), &[1, 1, 180]);
+        // Shorter than one frame: unchanged.
+        let tiny = Tensor::ones((1, 1, 10), DType::F32, &device)?;
+        assert_eq!(end_on_pause(&tiny, sr)?.dims(), &[1, 1, 10]);
+        Ok(())
+    }
 
     #[test]
     fn test_normalize_peak() -> anyhow::Result<()> {

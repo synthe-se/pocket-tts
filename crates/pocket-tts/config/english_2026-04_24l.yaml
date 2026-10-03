@@ -1,20 +1,7 @@
-weights_path: hf://kyutai/pocket-tts/languages/portuguese_24l/model.safetensors@2dd944b099d06bb9edbd221fef138685711d9bf0
-weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/languages/portuguese_24l/model.safetensors@4e1e0a3e611c51c0b4ed8174fc10f32a54644303
+weights_path: hf://kyutai/pocket-tts/languages/english_2026-04_24l/model.safetensors@492522650173a0653b7575cdc25ae09810e5d741
+weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/languages/english_2026-04_24l/model.safetensors@e81d79e8194ad4c7ce879c87a4258ef20cbf2487
 
-replace_characters:
-  '"': ''
-  '“': ''
-  '”': ''
-  '„': ''
-  '«': ''
-  '»': ''
-  '’': ''''
-  '‘': ''''
-  '(': ''
-  ')': ''
-  '[': ''
-  ']': ''
-
+default_temperature: 0.3
 flow_lm:
   insert_bos_before_voice: true
   dtype: float32
@@ -31,9 +18,7 @@ flow_lm:
     dim: 1024
     n_bins: 4000
     tokenizer: tokenizers
-    tokenizer_path: hf://kyutai/pocket-tts-without-voice-cloning/languages/portuguese_24l/tokenizer.json@4e1e0a3e611c51c0b4ed8174fc10f32a54644303
-  #weights_path: partial.safetensors
-
+    tokenizer_path: hf://kyutai/pocket-tts-without-voice-cloning/languages/english_2026-04_24l/tokenizer.json@00eac05ed3d16bdc3f6b5d598874019c34a89214
 mimi:
   dtype: float32
   sample_rate: 24000
@@ -69,4 +54,3 @@ mimi:
   quantizer:
     dimension: 32
     output_dimension: 512
-  #weights_path: codec.safetensors

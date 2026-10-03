@@ -36,7 +36,9 @@ fn export_import_roundtrip_matches() {
         assert_eq!(cursor.len, other_cursor.len, "{name}: len changed");
 
         for key in ["k_buf", "v_buf"] {
-            let a = module.get(key).unwrap_or_else(|| panic!("{name}: no {key}"));
+            let a = module
+                .get(key)
+                .unwrap_or_else(|| panic!("{name}: no {key}"));
             let b = other.get(key).unwrap_or_else(|| panic!("{name}: no {key}"));
             // The reloaded buffer holds exactly the valid slice.
             let a = a.narrow(2, 0, cursor.len).expect("narrow");
